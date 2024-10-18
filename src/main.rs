@@ -1,11 +1,17 @@
-use std::{net::Ipv4Addr, os::fd::AsRawFd};
+use std::{ffi::CString, net::Ipv4Addr, os::fd::AsRawFd};
 
 use anyhow::{bail, Result};
 use futures::TryStreamExt;
 use ipnetwork::{IpNetwork, Ipv4Network};
-use nix::sched::{setns, CloneFlags};
+use nftnl::{nft_expr, ChainType, Hook, MsgType, ProtoFamily};
+use nix::{
+    libc,
+    sched::{setns, CloneFlags},
+};
 use rtnetlink::NetworkNamespace;
 use tokio::fs::File;
+
+const PREFIX_LENGTH: u8 = 16;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -13,7 +19,7 @@ async fn main() -> Result<()> {
     tokio::spawn(connection);
 
     let bridge_ip = Ipv4Addr::new(172, 18, 0, 1);
-    let bridge_net = IpNetwork::V4(Ipv4Network::new(bridge_ip, 16)?);
+    let bridge_net = IpNetwork::V4(Ipv4Network::new(bridge_ip, PREFIX_LENGTH)?);
     let bridge_idx = create_bridge(&handle, "br0", &bridge_net).await?;
     let (veth_idx, ceth_idx) = create_veth_pair(&handle, "veth0", "ceth0").await?;
     handle
@@ -32,8 +38,12 @@ async fn main() -> Result<()> {
         .await?;
 
     let veth_ip = Ipv4Addr::new(172, 18, 0, 2);
-    let veth_net = IpNetwork::V4(Ipv4Network::new(veth_ip, 16)?);
+    let veth_net = IpNetwork::V4(Ipv4Network::new(veth_ip, PREFIX_LENGTH)?);
     setup_veth_peer(&ns_file, "ceth0", &veth_net, bridge_ip).await?;
+
+    let network_ip = Ipv4Addr::new(172, 18, 0, 0);
+    let container_net = IpNetwork::V4(Ipv4Network::new(network_ip, PREFIX_LENGTH)?);
+    create_nat(&container_net, "br0")?;
 
     Ok(())
 }
@@ -99,8 +109,8 @@ async fn create_veth_pair(
         .veth(name.to_string(), peer_name.to_string())
         .execute()
         .await?;
-    let veth_idx = get_index(handle, &name).await?;
-    let ceth_idx = get_index(handle, &peer_name).await?;
+    let veth_idx = get_index(handle, name).await?;
+    let ceth_idx = get_index(handle, peer_name).await?;
     handle.link().set(veth_idx).up().execute().await?;
     Ok((veth_idx, ceth_idx))
 }
@@ -143,4 +153,65 @@ async fn setup_veth_peer(
         .execute()
         .await?;
     Ok(())
+}
+
+// TODO: make this async with `tokio::spawn_blocking`
+/// Creates a NAT table and chain for the given network.
+fn create_nat(network: &IpNetwork, bridge_device: &str) -> Result<()> {
+    let mut batch = nftnl::Batch::new();
+    let table = nftnl::Table::new(&CString::new("container-nat")?, ProtoFamily::Ipv4);
+    batch.add(&table, MsgType::Add);
+
+    let mut chain = nftnl::Chain::new(&CString::new("postrouting-chain")?, &table);
+    chain.set_hook(Hook::PostRouting, libc::NF_IP_PRI_NAT_SRC);
+    chain.set_type(ChainType::Nat);
+    batch.add(&chain, MsgType::Add);
+
+    let mut rule = nftnl::Rule::new(&chain);
+    // match on the packet's source address
+    rule.add_expr(&nft_expr!(payload ipv4 saddr));
+    rule.add_expr(&nft_expr!(bitwise mask network.mask(), xor 0));
+    rule.add_expr(&nft_expr!(cmp == network.ip()));
+    // match interface
+    rule.add_expr(&nft_expr!(meta oifname));
+    rule.add_expr(&nft_expr!(cmp != bridge_device));
+    //apply masquerade
+    rule.add_expr(&nft_expr!(masquerade));
+    batch.add(&rule, MsgType::Add);
+
+    let finalized_batch = batch.finalize();
+    send_and_process(&finalized_batch)?;
+    Ok(())
+}
+
+// Taken from https://github.com/mullvad/nftnl-rs/blob/main/nftnl/examples/add-rules.rs
+fn send_and_process(batch: &nftnl::FinalizedBatch) -> Result<()> {
+    // Create a netlink socket to netfilter.
+    let socket = mnl::Socket::new(mnl::Bus::Netfilter)?;
+    // Send all the bytes in the batch.
+    socket.send_all(batch)?;
+
+    // Try to parse the messages coming back from netfilter. This part is still very unclear.
+    let portid = socket.portid();
+    let mut buffer = vec![0; nftnl::nft_nlmsg_maxsize() as usize];
+    let very_unclear_what_this_is_for = 2;
+    while let Some(message) = socket_recv(&socket, &mut buffer[..])? {
+        match mnl::cb_run(message, very_unclear_what_this_is_for, portid)? {
+            mnl::CbResult::Stop => {
+                break;
+            }
+            mnl::CbResult::Ok => (),
+        }
+    }
+    Ok(())
+}
+
+// Taken from https://github.com/mullvad/nftnl-rs/blob/main/nftnl/examples/add-rules.rs
+fn socket_recv<'a>(socket: &mnl::Socket, buf: &'a mut [u8]) -> Result<Option<&'a [u8]>> {
+    let ret = socket.recv(buf)?;
+    if ret > 0 {
+        Ok(Some(&buf[..ret]))
+    } else {
+        Ok(None)
+    }
 }
