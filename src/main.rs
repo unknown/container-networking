@@ -119,10 +119,12 @@ async fn setup_veth_peer(
     network: &IpNetwork,
     bridge_address: Ipv4Addr,
 ) -> Result<()> {
+    let init_netns = File::open("/proc/1/ns/net").await?;
     setns(ns_file, CloneFlags::CLONE_NEWNET)?;
     // TODO: handle closing the connection
     let (connection, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(connection);
+    setns(init_netns, CloneFlags::CLONE_NEWNET)?;
     let lo_idx = get_index(&handle, "lo").await?;
     handle.link().set(lo_idx).up().execute().await?;
     let ceth_idx = get_index(&handle, peer_name).await?;
