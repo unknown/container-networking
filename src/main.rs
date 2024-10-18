@@ -1,11 +1,8 @@
-use std::{
-    net::{IpAddr, Ipv4Addr},
-    os::fd::AsRawFd,
-    str::FromStr,
-};
+use std::{net::Ipv4Addr, os::fd::AsRawFd};
 
 use anyhow::{bail, Result};
 use futures::TryStreamExt;
+use ipnetwork::{IpNetwork, Ipv4Network};
 use nix::sched::{setns, CloneFlags};
 use rtnetlink::NetworkNamespace;
 use tokio::fs::File;
@@ -15,7 +12,9 @@ async fn main() -> Result<()> {
     let (connection, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(connection);
 
-    let bridge_idx = create_bridge(&handle, "br0", "172.18.0.1", 16).await?;
+    let bridge_ip = Ipv4Addr::new(172, 18, 0, 1);
+    let bridge_net = IpNetwork::V4(Ipv4Network::new(bridge_ip, 16)?);
+    let bridge_idx = create_bridge(&handle, "br0", &bridge_net).await?;
     let (veth_idx, ceth_idx) = create_veth_pair(&handle, "veth0", "ceth0").await?;
     handle
         .link()
@@ -31,7 +30,10 @@ async fn main() -> Result<()> {
         .setns_by_fd(ns_file.as_raw_fd())
         .execute()
         .await?;
-    setup_veth_peer(&ns_file, "ceth0", "172.18.0.2", 16, "172.18.0.1").await?;
+
+    let veth_ip = Ipv4Addr::new(172, 18, 0, 2);
+    let veth_net = IpNetwork::V4(Ipv4Network::new(veth_ip, 16)?);
+    setup_veth_peer(&ns_file, "ceth0", &veth_net, bridge_ip).await?;
 
     Ok(())
 }
@@ -52,12 +54,7 @@ async fn get_index(handle: &rtnetlink::Handle, name: &str) -> Result<u32> {
 /// ip addr add ADDRESS/PREFIX_LENGTH dev NAME
 /// ip link set NAME up
 /// ```
-async fn create_bridge(
-    handle: &rtnetlink::Handle,
-    name: &str,
-    address: &str,
-    prefix_length: u8,
-) -> Result<u32> {
+async fn create_bridge(handle: &rtnetlink::Handle, name: &str, network: &IpNetwork) -> Result<u32> {
     handle
         .link()
         .add()
@@ -65,10 +62,9 @@ async fn create_bridge(
         .execute()
         .await?;
     let index = get_index(handle, name).await?;
-    let bridge_addr = IpAddr::V4(Ipv4Addr::from_str(address)?);
     handle
         .address()
-        .add(index, bridge_addr, prefix_length)
+        .add(index, network.ip(), network.prefix())
         .execute()
         .await?;
     handle.link().set(index).up().execute().await?;
@@ -120,9 +116,8 @@ async fn create_veth_pair(
 async fn setup_veth_peer(
     ns_file: &std::fs::File,
     peer_name: &str,
-    address: &str,
-    prefix_length: u8,
-    bridge_address: &str,
+    network: &IpNetwork,
+    bridge_address: Ipv4Addr,
 ) -> Result<()> {
     setns(ns_file, CloneFlags::CLONE_NEWNET)?;
     // TODO: handle closing the connection
@@ -132,10 +127,9 @@ async fn setup_veth_peer(
     handle.link().set(lo_idx).up().execute().await?;
     let ceth_idx = get_index(&handle, peer_name).await?;
     handle.link().set(ceth_idx).up().execute().await?;
-    let addr = IpAddr::V4(Ipv4Addr::from_str(address)?);
     handle
         .address()
-        .add(ceth_idx, addr, prefix_length)
+        .add(ceth_idx, network.ip(), network.prefix())
         .execute()
         .await?;
     handle
@@ -143,7 +137,7 @@ async fn setup_veth_peer(
         .add()
         .v4()
         .destination_prefix(Ipv4Addr::UNSPECIFIED, 0)
-        .gateway(Ipv4Addr::from_str(bridge_address)?)
+        .gateway(bridge_address)
         .execute()
         .await?;
     Ok(())
