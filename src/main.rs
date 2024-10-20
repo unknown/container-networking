@@ -131,7 +131,6 @@ async fn setup_veth_peer(
 ) -> Result<()> {
     let init_netns = File::open("/proc/1/ns/net").await?;
     setns(ns_file, CloneFlags::CLONE_NEWNET)?;
-    // TODO: handle closing the connection
     let (connection, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(connection);
     setns(init_netns, CloneFlags::CLONE_NEWNET)?;
@@ -155,7 +154,6 @@ async fn setup_veth_peer(
     Ok(())
 }
 
-// TODO: make this async with `tokio::spawn_blocking`
 /// Creates a NAT table and chain for the given network.
 fn create_nat(network: &IpNetwork, bridge_device: &str) -> Result<()> {
     let mut batch = nftnl::Batch::new();
